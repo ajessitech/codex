@@ -9,6 +9,7 @@ use crate::models_manager::manager::ModelsManager;
 use crate::skills::SkillsManager;
 use crate::state_db::StateDbHandle;
 use crate::tools::sandboxing::ApprovalStore;
+use crate::trace_spine::TraceSpineRecorder;
 use crate::unified_exec::UnifiedExecProcessManager;
 use crate::user_notification::UserNotifier;
 use codex_otel::OtelManager;
@@ -22,6 +23,7 @@ pub(crate) struct SessionServices {
     pub(crate) unified_exec_manager: UnifiedExecProcessManager,
     pub(crate) notifier: UserNotifier,
     pub(crate) rollout: Mutex<Option<RolloutRecorder>>,
+    pub(crate) trace_spine: Option<TraceSpineRecorder>,
     pub(crate) user_shell: Arc<crate::shell::Shell>,
     pub(crate) show_raw_agent_reasoning: bool,
     pub(crate) exec_policy: ExecPolicyManager,

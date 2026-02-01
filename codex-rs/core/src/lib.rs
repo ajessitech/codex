@@ -53,6 +53,8 @@ mod session_prefix;
 mod stream_events_utils;
 mod text_encoding;
 pub mod token_data;
+pub mod trace_spine;
+pub mod atif_export;
 mod truncate;
 mod unified_exec;
 pub mod windows_sandbox;

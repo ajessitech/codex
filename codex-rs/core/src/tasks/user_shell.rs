@@ -119,6 +119,7 @@ impl SessionTask for UserShellCommandTask {
             sub_id: turn_context.sub_id.clone(),
             call_id: call_id.clone(),
             tx_event: session.get_tx_event(),
+            trace_spine: session.trace_spine_recorder(),
         });
 
         let sandbox_policy = SandboxPolicy::DangerFullAccess;

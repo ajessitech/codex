@@ -32,6 +32,7 @@ use crate::sandboxing::SandboxPermissions;
 use crate::spawn::StdioPolicy;
 use crate::spawn::spawn_child_async;
 use crate::text_encoding::bytes_to_string_smart;
+use crate::trace_spine::TraceSpineRecorder;
 use codex_utils_pty::process_group::kill_child_process_group;
 
 pub const DEFAULT_EXEC_COMMAND_TIMEOUT_MS: u64 = 10_000;
@@ -133,6 +134,7 @@ pub struct StdoutStream {
     pub sub_id: String,
     pub call_id: String,
     pub tx_event: Sender<Event>,
+    pub trace_spine: Option<TraceSpineRecorder>,
 }
 
 pub async fn process_exec_tool_call(
@@ -830,6 +832,11 @@ async fn read_capped<R: AsyncRead + Unpin + Send + 'static>(
                 id: stream.sub_id.clone(),
                 msg,
             };
+            if let Some(trace) = stream.trace_spine.as_ref() {
+                if let Err(err) = trace.record_event(&event).await {
+                    tracing::warn!("failed to record exec output delta in trace spine: {err}");
+                }
+            }
             #[allow(clippy::let_unit_value)]
             let _ = stream.tx_event.send(event).await;
             emitted_deltas += 1;

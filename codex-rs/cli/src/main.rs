@@ -32,10 +32,12 @@ use std::path::PathBuf;
 use supports_color::Stream;
 
 mod mcp_cmd;
+mod trace_cmd;
 #[cfg(not(windows))]
 mod wsl_paths;
 
 use crate::mcp_cmd::McpCli;
+use crate::trace_cmd::TraceCli;
 
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
@@ -91,6 +93,9 @@ enum Subcommand {
 
     /// [experimental] Run the Codex MCP server (stdio transport).
     McpServer,
+
+    /// Trace spine tooling (bundle, distill, dataset).
+    Trace(TraceCli),
 
     /// [experimental] Run the app server or related tooling.
     AppServer(AppServerCommand),
@@ -507,6 +512,9 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
         }
         Some(Subcommand::McpServer) => {
             codex_mcp_server::run_main(codex_linux_sandbox_exe, root_config_overrides).await?;
+        }
+        Some(Subcommand::Trace(trace_cli)) => {
+            trace_cli.run().await?;
         }
         Some(Subcommand::Mcp(mut mcp_cli)) => {
             // Propagate any root-level config overrides (e.g. `-c key=value`).

@@ -30,6 +30,8 @@ use crate::codex::TurnContext;
 use crate::config::Config;
 use crate::error::CodexErr;
 use crate::models_manager::manager::ModelsManager;
+use crate::trace_spine::TraceBridgeKind;
+use crate::trace_spine::TraceBridgeRecord;
 use codex_protocol::protocol::InitialHistory;
 
 /// Start an interactive sub-Codex thread and return IO channels.
@@ -325,6 +327,20 @@ async fn handle_exec_approval(
     )
     .await;
 
+    parent_session
+        .record_trace_bridge(TraceBridgeRecord {
+            bridge_kind: TraceBridgeKind::ExecApproval,
+            parent_thread_id: parent_session.conversation_id,
+            parent_turn_id: parent_ctx.sub_id.clone(),
+            parent_call_id: None,
+            sub_agent_thread_id: codex.session.conversation_id,
+            sub_agent_turn_id: id.clone(),
+            sub_agent_call_id: event.call_id.clone(),
+            decision: Some(decision.clone()),
+            user_input_response: None,
+        })
+        .await;
+
     let _ = codex.submit(Op::ExecApproval { id, decision }).await;
 }
 
@@ -353,6 +369,19 @@ async fn handle_patch_approval(
         cancel_token,
     )
     .await;
+    parent_session
+        .record_trace_bridge(TraceBridgeRecord {
+            bridge_kind: TraceBridgeKind::PatchApproval,
+            parent_thread_id: parent_session.conversation_id,
+            parent_turn_id: parent_ctx.sub_id.clone(),
+            parent_call_id: None,
+            sub_agent_thread_id: codex.session.conversation_id,
+            sub_agent_turn_id: id.clone(),
+            sub_agent_call_id: event.call_id.clone(),
+            decision: Some(decision.clone()),
+            user_input_response: None,
+        })
+        .await;
     let _ = codex.submit(Op::PatchApproval { id, decision }).await;
 }
 
@@ -376,6 +405,19 @@ async fn handle_request_user_input(
         cancel_token,
     )
     .await;
+    parent_session
+        .record_trace_bridge(TraceBridgeRecord {
+            bridge_kind: TraceBridgeKind::RequestUserInput,
+            parent_thread_id: parent_session.conversation_id,
+            parent_turn_id: parent_ctx.sub_id.clone(),
+            parent_call_id: None,
+            sub_agent_thread_id: codex.session.conversation_id,
+            sub_agent_turn_id: id.clone(),
+            sub_agent_call_id: event.call_id.clone(),
+            decision: None,
+            user_input_response: Some(response.clone()),
+        })
+        .await;
     let _ = codex.submit(Op::UserInputAnswer { id, response }).await;
 }
 

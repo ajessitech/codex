@@ -157,6 +157,10 @@ use crate::protocol::TurnDiffEvent;
 use crate::protocol::WarningEvent;
 use crate::rollout::RolloutRecorder;
 use crate::rollout::RolloutRecorderParams;
+use crate::trace_spine::TraceSpineRecorder;
+use crate::trace_spine::TraceSpineRecorderParams;
+use crate::trace_spine::record_artifacts_on_startup;
+use crate::trace_spine::record_shell_snapshot_artifact;
 use crate::rollout::map_session_init_error;
 use crate::rollout::metadata;
 use crate::shell;
@@ -700,7 +704,7 @@ impl Session {
                     RolloutRecorderParams::new(
                         conversation_id,
                         forked_from_id,
-                        session_source,
+                        session_source.clone(),
                         BaseInstructions {
                             text: session_configuration.base_instructions.clone(),
                         },
@@ -711,6 +715,19 @@ impl Session {
                 resumed_history.conversation_id,
                 RolloutRecorderParams::resume(resumed_history.rollout_path.clone()),
             ),
+        };
+        let trace_params = match &initial_history {
+            InitialHistory::New | InitialHistory::Forked(_) => TraceSpineRecorderParams::Create {
+                conversation_id,
+                forked_from_id,
+                source: session_source.clone(),
+                base_instructions: BaseInstructions {
+                    text: session_configuration.base_instructions.clone(),
+                },
+            },
+            InitialHistory::Resumed(resumed_history) => TraceSpineRecorderParams::Resume {
+                conversation_id: resumed_history.conversation_id,
+            },
         };
         let state_builder = match &initial_history {
             InitialHistory::Resumed(resumed) => metadata::builder_from_items(
@@ -740,6 +757,14 @@ impl Session {
                 Ok((Some(rollout_recorder), state_db_ctx))
             }
         };
+        let trace_fut = async {
+            if config.ephemeral {
+                Ok::<_, anyhow::Error>(None)
+            } else {
+                let trace = TraceSpineRecorder::new(&config, trace_params).await?;
+                Ok(Some(trace))
+            }
+        };
 
         let history_meta_fut = crate::message_history::history_metadata(&config);
         let auth_manager_clone = Arc::clone(&auth_manager);
@@ -758,12 +783,17 @@ impl Session {
         // Join all independent futures.
         let (
             rollout_recorder_and_state_db,
+            trace_recorder,
             (history_log_id, history_entry_count),
             (auth, mcp_servers, auth_statuses),
-        ) = tokio::join!(rollout_fut, history_meta_fut, auth_and_mcp_fut);
+        ) = tokio::join!(rollout_fut, trace_fut, history_meta_fut, auth_and_mcp_fut);
 
         let (rollout_recorder, state_db_ctx) = rollout_recorder_and_state_db.map_err(|e| {
             error!("failed to initialize rollout recorder: {e:#}");
+            e
+        })?;
+        let trace_recorder = trace_recorder.map_err(|e| {
+            error!("failed to initialize trace spine recorder: {e:#}");
             e
         })?;
         let rollout_path = rollout_recorder
@@ -853,6 +883,7 @@ impl Session {
             unified_exec_manager: UnifiedExecProcessManager::default(),
             notifier: UserNotifier::new(config.notify.clone()),
             rollout: Mutex::new(rollout_recorder),
+            trace_spine: trace_recorder.clone(),
             user_shell: Arc::new(default_shell),
             show_raw_agent_reasoning: config.show_raw_agent_reasoning,
             exec_policy,
@@ -876,6 +907,29 @@ impl Session {
             services,
             next_internal_sub_id: AtomicU64::new(0),
         });
+
+        if let Some(trace) = trace_recorder {
+            let cwd = session_configuration.cwd.clone();
+            tokio::spawn(async move {
+                let _ = record_artifacts_on_startup(trace, cwd).await;
+            });
+        }
+        if config.features.enabled(Feature::ShellSnapshot) {
+            if let Some(trace) = sess.services.trace_spine.clone() {
+                let shell = Arc::clone(&sess.services.user_shell);
+                let mut snapshot_rx = shell.shell_snapshot.clone();
+                let shell_name = shell.name().to_string();
+                tokio::spawn(async move {
+                    if snapshot_rx.changed().await.is_err() {
+                        return;
+                    }
+                    let Some(snapshot) = snapshot_rx.borrow().clone() else {
+                        return;
+                    };
+                    record_shell_snapshot_artifact(trace, snapshot.path.clone(), shell_name).await;
+                });
+            }
+        }
 
         // Dispatch the SessionConfiguredEvent first and then report any errors.
         // If resuming, include converted initial messages in the payload so UIs can render them immediately.
@@ -939,6 +993,10 @@ impl Session {
         self.services.state_db.clone()
     }
 
+    pub(crate) fn trace_spine_recorder(&self) -> Option<TraceSpineRecorder> {
+        self.services.trace_spine.clone()
+    }
+
     /// Ensure all rollout writes are durably flushed.
     pub(crate) async fn flush_rollout(&self) {
         let recorder = {
@@ -949,6 +1007,56 @@ impl Session {
             && let Err(e) = rec.flush().await
         {
             warn!("failed to flush rollout recorder: {e}");
+        }
+    }
+
+    pub(crate) async fn record_trace_submission(&self, submission: &Submission) {
+        if let Some(trace) = self.services.trace_spine.as_ref() {
+            if let Err(err) = trace.record_submission(submission).await {
+                warn!("failed to record trace spine submission: {err}");
+            }
+        }
+    }
+
+    pub(crate) async fn record_trace_event(&self, event: &Event) {
+        if let Some(trace) = self.services.trace_spine.as_ref() {
+            if let Err(err) = trace.record_event(event).await {
+                warn!("failed to record trace spine event: {err}");
+            }
+        }
+    }
+
+    pub(crate) async fn record_trace_turn_context(
+        &self,
+        turn_id: String,
+        context: TurnContextItem,
+    ) {
+        if let Some(trace) = self.services.trace_spine.as_ref() {
+            if let Err(err) = trace.record_turn_context(turn_id, context).await {
+                warn!("failed to record trace spine turn context: {err}");
+            }
+        }
+    }
+
+    pub(crate) async fn record_trace_compaction_boundary(
+        &self,
+        boundary: crate::trace_spine::TraceCompactionBoundary,
+    ) {
+        if let Some(trace) = self.services.trace_spine.as_ref() {
+            if let Err(err) = trace.record_compaction_boundary(boundary).await {
+                warn!("failed to record trace spine compaction boundary: {err}");
+            }
+        }
+    }
+
+    pub(crate) async fn record_trace_bridge(
+        &self,
+        record: crate::trace_spine::TraceBridgeRecord,
+    ) {
+        if let Some(trace) = self.services.trace_spine.as_ref() {
+            if let Err(err) = trace.record_bridge(record).await {
+                warn!("failed to record trace spine bridge record: {err}");
+            }
         }
     }
 
@@ -1361,6 +1469,7 @@ impl Session {
         if let Some(status) = agent_status_from_event(&event.msg) {
             self.agent_status.send_replace(status);
         }
+        self.record_trace_event(&event).await;
         // Persist the event into rollout (recorder filters as needed)
         let rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
         self.persist_rollout_items(&rollout_items).await;
@@ -1379,6 +1488,7 @@ impl Session {
         if let Some(status) = agent_status_from_event(&event.msg) {
             self.agent_status.send_replace(status);
         }
+        self.record_trace_event(&event).await;
         self.persist_rollout_items(&[RolloutItem::EventMsg(event.msg.clone())])
             .await;
         self.flush_rollout().await;
@@ -2303,6 +2413,7 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
     // To break out of this loop, send Op::Shutdown.
     while let Ok(sub) = rx_sub.recv().await {
         debug!(?sub, "Submission");
+        sess.record_trace_submission(&sub).await;
         match sub.op.clone() {
             Op::Interrupt => {
                 handlers::interrupt(&sess).await;
@@ -2933,6 +3044,22 @@ mod handlers {
                 id: sub_id.clone(),
                 msg: EventMsg::Error(ErrorEvent {
                     message: "Failed to shutdown rollout recorder".to_string(),
+                    codex_error_info: Some(CodexErrorInfo::Other),
+                }),
+            };
+            sess.send_event_raw(event).await;
+        }
+
+        // Gracefully flush and shutdown trace spine recorder so segment metadata
+        // is written and the trace is complete.
+        if let Some(ref trace) = sess.services.trace_spine
+            && let Err(e) = trace.shutdown().await
+        {
+            warn!("failed to shutdown trace spine recorder: {e}");
+            let event = Event {
+                id: sub_id.clone(),
+                msg: EventMsg::Error(ErrorEvent {
+                    message: "Failed to shutdown trace spine recorder".to_string(),
                     codex_error_info: Some(CodexErrorInfo::Other),
                 }),
             };
@@ -3628,7 +3755,7 @@ async fn try_run_sampling_request(
     // duplicating model settings on TurnContext, but a later Op could update the session config
     // before this write occurs.
     let collaboration_mode = sess.current_collaboration_mode().await;
-    let rollout_item = RolloutItem::TurnContext(TurnContextItem {
+    let turn_context_item = TurnContextItem {
         cwd: turn_context.cwd.clone(),
         approval_policy: turn_context.approval_policy,
         sandbox_policy: turn_context.sandbox_policy.clone(),
@@ -3641,7 +3768,8 @@ async fn try_run_sampling_request(
         developer_instructions: turn_context.developer_instructions.clone(),
         final_output_json_schema: turn_context.final_output_json_schema.clone(),
         truncation_policy: Some(turn_context.truncation_policy.into()),
-    });
+    };
+    let rollout_item = RolloutItem::TurnContext(turn_context_item.clone());
 
     feedback_tags!(
         model = turn_context.client.get_model(),
@@ -3652,6 +3780,8 @@ async fn try_run_sampling_request(
         features = sess.features.enabled_features(),
     );
 
+    sess.record_trace_turn_context(turn_context.sub_id.clone(), turn_context_item)
+        .await;
     sess.persist_rollout_items(&[rollout_item]).await;
     let mut stream = client_session
         .stream(prompt)
@@ -4737,6 +4867,7 @@ mod tests {
             unified_exec_manager: UnifiedExecProcessManager::default(),
             notifier: UserNotifier::new(None),
             rollout: Mutex::new(None),
+            trace_spine: None,
             user_shell: Arc::new(default_user_shell()),
             show_raw_agent_reasoning: config.show_raw_agent_reasoning,
             exec_policy,
@@ -4849,6 +4980,7 @@ mod tests {
             unified_exec_manager: UnifiedExecProcessManager::default(),
             notifier: UserNotifier::new(None),
             rollout: Mutex::new(None),
+            trace_spine: None,
             user_shell: Arc::new(default_user_shell()),
             show_raw_agent_reasoning: config.show_raw_agent_reasoning,
             exec_policy,

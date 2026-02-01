@@ -8,6 +8,9 @@ use crate::protocol::CompactedItem;
 use crate::protocol::EventMsg;
 use crate::protocol::RolloutItem;
 use crate::protocol::TurnStartedEvent;
+use crate::protocol::TurnContextItem;
+use crate::trace_spine::CompactionKind;
+use crate::trace_spine::TraceCompactionBoundary;
 use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
@@ -45,6 +48,28 @@ async fn run_remote_compact_task_inner_impl(
     sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
     let history = sess.clone_history().await;
+    let pre_compaction_history = history.raw_items().to_vec();
+
+    let rollout_item = RolloutItem::TurnContext(TurnContextItem {
+        cwd: turn_context.cwd.clone(),
+        approval_policy: turn_context.approval_policy,
+        sandbox_policy: turn_context.sandbox_policy.clone(),
+        model: turn_context.client.get_model(),
+        personality: turn_context.personality,
+        collaboration_mode: Some(sess.current_collaboration_mode().await),
+        effort: turn_context.client.get_reasoning_effort(),
+        summary: turn_context.client.get_reasoning_summary(),
+        user_instructions: turn_context.user_instructions.clone(),
+        developer_instructions: turn_context.developer_instructions.clone(),
+        final_output_json_schema: turn_context.final_output_json_schema.clone(),
+        truncation_policy: Some(turn_context.truncation_policy.into()),
+    });
+    sess.record_trace_turn_context(turn_context.sub_id.clone(), match &rollout_item {
+        RolloutItem::TurnContext(ctx) => ctx.clone(),
+        _ => unreachable!("turn context rollout item always contains context"),
+    })
+    .await;
+    sess.persist_rollout_items(&[rollout_item]).await;
 
     // Required to keep `/undo` available after compaction
     let ghost_snapshots: Vec<ResponseItem> = history
@@ -71,6 +96,14 @@ async fn run_remote_compact_task_inner_impl(
     if !ghost_snapshots.is_empty() {
         new_history.extend(ghost_snapshots);
     }
+    let boundary = TraceCompactionBoundary {
+        turn_id: turn_context.sub_id.clone(),
+        kind: CompactionKind::Remote,
+        summary_message: None,
+        pre_compaction_history,
+        post_compaction_history: new_history.clone(),
+    };
+    sess.record_trace_compaction_boundary(boundary).await;
     sess.replace_history(new_history.clone()).await;
     sess.recompute_token_usage(turn_context).await;
 

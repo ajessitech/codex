@@ -72,6 +72,7 @@ impl ApplyPatchRuntime {
             sub_id: ctx.turn.sub_id.clone(),
             call_id: ctx.call_id.clone(),
             tx_event: ctx.session.get_tx_event(),
+            trace_spine: ctx.session.trace_spine_recorder(),
         })
     }
 }

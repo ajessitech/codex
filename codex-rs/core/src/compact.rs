@@ -19,6 +19,8 @@ use crate::truncate::TruncationPolicy;
 use crate::truncate::approx_token_count;
 use crate::truncate::truncate_text;
 use crate::util::backoff;
+use crate::trace_spine::CompactionKind;
+use crate::trace_spine::TraceCompactionBoundary;
 use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
@@ -77,6 +79,7 @@ async fn run_compact_task_inner(
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
 
     let mut history = sess.clone_history().await;
+    let pre_compaction_history = history.raw_items().to_vec();
     history.record_items(
         &[initial_input_for_turn.into()],
         turn_context.truncation_policy,
@@ -92,7 +95,7 @@ async fn run_compact_task_inner(
     // duplicating model settings on TurnContext, but an Op after turn start could update the
     // session config before this write occurs.
     let collaboration_mode = sess.current_collaboration_mode().await;
-    let rollout_item = RolloutItem::TurnContext(TurnContextItem {
+    let turn_context_item = TurnContextItem {
         cwd: turn_context.cwd.clone(),
         approval_policy: turn_context.approval_policy,
         sandbox_policy: turn_context.sandbox_policy.clone(),
@@ -105,7 +108,10 @@ async fn run_compact_task_inner(
         developer_instructions: turn_context.developer_instructions.clone(),
         final_output_json_schema: turn_context.final_output_json_schema.clone(),
         truncation_policy: Some(turn_context.truncation_policy.into()),
-    });
+    };
+    let rollout_item = RolloutItem::TurnContext(turn_context_item.clone());
+    sess.record_trace_turn_context(turn_context.sub_id.clone(), turn_context_item)
+        .await;
     sess.persist_rollout_items(&[rollout_item]).await;
 
     loop {
@@ -187,6 +193,14 @@ async fn run_compact_task_inner(
         .cloned()
         .collect();
     new_history.extend(ghost_snapshots);
+    let boundary = TraceCompactionBoundary {
+        turn_id: turn_context.sub_id.clone(),
+        kind: CompactionKind::Local,
+        summary_message: Some(summary_text.clone()),
+        pre_compaction_history,
+        post_compaction_history: new_history.clone(),
+    };
+    sess.record_trace_compaction_boundary(boundary).await;
     sess.replace_history(new_history).await;
     sess.recompute_token_usage(&turn_context).await;
 
